@@ -3,10 +3,11 @@ use std::{
     io::{Error, ErrorKind},
     num::IntErrorKind,
     os::unix::fs::FileExt,
+    path::Path,
 };
 
 use bytemuck::AnyBitPattern;
-use libc::{iovec, process_vm_readv};
+use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -25,6 +26,14 @@ pub enum ProcessError {
 pub enum ReadError {
     #[error("the requested address is out of range")]
     OutOfRange,
+    #[error("the process has quit")]
+    ProcessQuit,
+    #[error("permission to read memory was denied")]
+    PermissionDenied,
+    #[error("data could not be parsed to type {0}")]
+    InvalidData(&'static str),
+    #[error("unknown read error")]
+    Unknown,
 }
 
 pub struct Process {
@@ -121,50 +130,65 @@ impl Process {
         })
     }
 
+    pub fn is_running(&self) -> bool {
+        Path::new(&format!("/proc/{}/mem", self.pid)).exists()
+    }
+
     pub fn pid(&self) -> i32 {
         self.pid
     }
 
     pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, ReadError> {
         let mut buffer = vec![0u8; std::mem::size_of::<T>()];
-        match &self.memory {
-            Some(memory) => {
-                if memory.read_at(&mut buffer, address as u64).is_err() {
-                    return Err(ReadError::OutOfRange);
-                }
+        if let Some(memory) = &self.memory {
+            if let Err(error) = memory.read_at(&mut buffer, address as u64) {
+                return Err(if error.kind() == ErrorKind::PermissionDenied {
+                    ReadError::PermissionDenied
+                } else {
+                    ReadError::Unknown
+                });
             }
-            None => {
-                let local_iov = iovec {
-                    iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: buffer.len(),
-                };
-                let remote_iov = iovec {
-                    iov_base: address as *mut libc::c_void,
-                    iov_len: buffer.len(),
-                };
+        } else {
+            let local_iov = iovec {
+                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+            let remote_iov = iovec {
+                iov_base: address as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
 
-                let bytes_read =
-                    unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
-                if bytes_read < 0 {
-                    let os_error = Error::last_os_error();
-                    return Err(match os_error.kind() {
-                        _ => ReadError::OutOfRange,
-                    });
-                }
+            let bytes_read =
+                unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
+            if bytes_read < 0 {
+                let os_error = Error::last_os_error().raw_os_error();
+                return Err(match os_error {
+                    Some(EFAULT) => ReadError::OutOfRange,
+                    Some(ESRCH) => ReadError::ProcessQuit,
+                    Some(EPERM) => ReadError::PermissionDenied,
+                    _ => ReadError::Unknown,
+                });
             }
         }
 
         match bytemuck::try_from_bytes::<T>(&buffer).cloned() {
             Ok(value) => Ok(value),
-            Err(error) => Err(ReadError::OutOfRange),
+            Err(_) => Err(ReadError::InvalidData(std::any::type_name::<T>())),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Process;
+
+    fn pid() -> i32 {
+        std::process::id() as i32
+    }
 
     #[test]
-    fn it_works() {}
+    fn create() {
+        let process = Process::open_pid(pid());
+        assert!(process.is_ok());
+    }
 }

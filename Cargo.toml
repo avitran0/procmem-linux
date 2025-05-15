@@ -2,6 +2,12 @@
 name = "procmem-linux"
 version = "0.1.0"
 edition = "2024"
+authors = ["avitran0"]
+license = "GPL-3.0"
+description = "read and write process memory on linux"
+homepage = "https://github.com/avitran0/procmem-linux"
+repository = "https://github.com/avitran0/procmem-linux"
+readme = "readme.md"
 
 [dependencies]
 bytemuck = "1.23"
