@@ -1,13 +1,13 @@
 use std::{
     fs::{File, OpenOptions, read_dir, read_link},
-    io::{Error, ErrorKind},
+    io::{BufRead, BufReader, Error, ErrorKind},
     num::IntErrorKind,
     os::unix::fs::FileExt,
     path::Path,
 };
 
-use bytemuck::AnyBitPattern;
-use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv};
+use bytemuck::{AnyBitPattern, NoUninit};
+use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv, process_vm_writev};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -23,12 +23,12 @@ pub enum ProcessError {
 }
 
 #[derive(Error, Debug)]
-pub enum ReadError {
+pub enum MemoryError {
     #[error("the requested address is out of range")]
     OutOfRange,
     #[error("the process has quit")]
     ProcessQuit,
-    #[error("permission to read memory was denied")]
+    #[error("permission to memory was denied")]
     PermissionDenied,
     #[error("data could not be parsed to type {0}")]
     InvalidData(&'static str),
@@ -36,9 +36,16 @@ pub enum ReadError {
     Unknown,
 }
 
+#[derive(PartialEq)]
+enum MemoryMode {
+    File,
+    Syscall,
+}
+
 pub struct Process {
     pid: i32,
-    memory: Option<File>,
+    memory: File,
+    mode: MemoryMode,
 }
 
 impl Process {
@@ -104,10 +111,6 @@ impl Process {
 
         let has_proc_read = unsafe { process_vm_readv(pid, &iov, 1, &iov, 1, 0) } > 0;
 
-        if has_proc_read {
-            return Ok(Process { pid, memory: None });
-        }
-
         // process_vm_readv does not work, use /proc/{pid}/mem instead
         let memory = match OpenOptions::new()
             .read(true)
@@ -126,7 +129,12 @@ impl Process {
 
         Ok(Process {
             pid,
-            memory: Some(memory),
+            memory,
+            mode: if has_proc_read {
+                MemoryMode::Syscall
+            } else {
+                MemoryMode::File
+            },
         })
     }
 
@@ -138,14 +146,14 @@ impl Process {
         self.pid
     }
 
-    pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, ReadError> {
+    pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, MemoryError> {
         let mut buffer = vec![0u8; std::mem::size_of::<T>()];
-        if let Some(memory) = &self.memory {
-            if let Err(error) = memory.read_at(&mut buffer, address as u64) {
+        if self.mode == MemoryMode::File {
+            if let Err(error) = &self.memory.read_at(&mut buffer, address as u64) {
                 return Err(if error.kind() == ErrorKind::PermissionDenied {
-                    ReadError::PermissionDenied
+                    MemoryError::PermissionDenied
                 } else {
-                    ReadError::Unknown
+                    MemoryError::Unknown
                 });
             }
         } else {
@@ -163,18 +171,95 @@ impl Process {
             if bytes_read < 0 {
                 let os_error = Error::last_os_error().raw_os_error();
                 return Err(match os_error {
-                    Some(EFAULT) => ReadError::OutOfRange,
-                    Some(ESRCH) => ReadError::ProcessQuit,
-                    Some(EPERM) => ReadError::PermissionDenied,
-                    _ => ReadError::Unknown,
+                    Some(EFAULT) => MemoryError::OutOfRange,
+                    Some(ESRCH) => MemoryError::ProcessQuit,
+                    Some(EPERM) => MemoryError::PermissionDenied,
+                    _ => MemoryError::Unknown,
                 });
             }
         }
 
         match bytemuck::try_from_bytes::<T>(&buffer).cloned() {
             Ok(value) => Ok(value),
-            Err(_) => Err(ReadError::InvalidData(std::any::type_name::<T>())),
+            Err(_) => Err(MemoryError::InvalidData(std::any::type_name::<T>())),
         }
+    }
+
+    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
+        let mut buffer = bytemuck::bytes_of(value).to_vec();
+        if self.mode == MemoryMode::File {
+            if let Err(error) = &self.memory.write_at(&buffer, address as u64) {
+                return Err(if error.kind() == ErrorKind::PermissionDenied {
+                    MemoryError::PermissionDenied
+                } else {
+                    MemoryError::Unknown
+                });
+            }
+        } else {
+            let local_iov = iovec {
+                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+            let remote_iov = iovec {
+                iov_base: address as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+
+            let bytes_written =
+                unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
+            if bytes_written < 0 {
+                let os_error = Error::last_os_error().raw_os_error();
+                return Err(match os_error {
+                    Some(EFAULT) => MemoryError::OutOfRange,
+                    Some(ESRCH) => MemoryError::ProcessQuit,
+                    Some(EPERM) => MemoryError::PermissionDenied,
+                    _ => MemoryError::Unknown,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, address: usize, count: usize) -> Result<Vec<u8>, MemoryError> {
+        let mut buffer = vec![0u8; count];
+        if let Err(error) = self.memory.read_at(&mut buffer, address as u64) {
+            return Err(if error.kind() == ErrorKind::PermissionDenied {
+                MemoryError::PermissionDenied
+            } else {
+                MemoryError::Unknown
+            });
+        }
+        Ok(buffer)
+    }
+
+    pub fn write_bytes(&self, address: usize, value: &[u8]) -> Result<(), MemoryError> {
+        if let Err(error) = self.memory.write_at(value, address as u64) {
+            return Err(if error.kind() == ErrorKind::PermissionDenied {
+                MemoryError::PermissionDenied
+            } else {
+                MemoryError::Unknown
+            });
+        }
+        Ok(())
+    }
+
+    /// tries to find the address of a library loaded into the process
+    pub fn find_library(&self, library: &str) -> Option<usize> {
+        let maps = File::open(format!("/proc/{}/maps", self.pid)).unwrap();
+        for line in BufReader::new(maps).lines() {
+            if line.is_err() {
+                continue;
+            }
+            let line = line.unwrap();
+            if !line.contains(library) {
+                continue;
+            }
+            let (address, _) = line.split_once('-').unwrap();
+            let address = usize::from_str_radix(address, 16).unwrap();
+            return Some(address);
+        }
+        None
     }
 }
 
