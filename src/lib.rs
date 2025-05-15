@@ -1,3 +1,5 @@
+#![doc = include_str!("../readme.md")]
+
 use std::{
     fs::{File, OpenOptions, read_dir, read_link},
     io::{BufRead, BufReader, Error, ErrorKind},
@@ -284,5 +286,60 @@ mod tests {
     fn create() {
         let process = Process::open_pid(pid());
         assert!(process.is_ok());
+    }
+
+    #[test]
+    fn read() {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer = [0x55u8];
+        let value = process.read::<u8>(buffer.as_ptr() as usize);
+        assert!(value.is_ok());
+        assert!(value.unwrap() == 0x55u8);
+    }
+
+    #[test]
+    fn write() {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer = [0x55u8];
+        let result = process.write::<u8>(buffer.as_ptr() as usize, &0x66);
+        assert!(result.is_ok());
+        assert!(buffer[0] == 0x66u8);
+    }
+
+    #[test]
+    fn read_bytes() {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let value = process.read_bytes(buffer.as_ptr() as usize, 4);
+        assert!(value.is_ok());
+        assert!(value.unwrap() == buffer);
+    }
+
+    #[test]
+    fn write_bytes() {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let result = process.write_bytes(buffer.as_ptr() as usize, &[0x55, 0x66, 0x77, 0x88]);
+        assert!(result.is_ok());
+        assert!(buffer == [0x55, 0x66, 0x77, 0x88]);
+    }
+
+    #[test]
+    fn read_terminated_string() {
+        let process = Process::open_pid(pid()).unwrap();
+        const STRING: &str = "Hello World";
+        let buffer = std::ffi::CString::new(STRING).unwrap();
+        let value = process.read_terminated_string(buffer.as_ptr() as usize);
+        assert!(value.is_ok());
+        assert!(value.unwrap() == *STRING);
+    }
+
+    #[test]
+    fn read_string() {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer = "Hello World";
+        let value = process.read_string(buffer.as_ptr() as usize, buffer.len());
+        assert!(value.is_ok());
+        assert!(value.unwrap() == buffer);
     }
 }
