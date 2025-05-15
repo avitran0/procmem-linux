@@ -1,0 +1,9 @@
+[package]
+name = "procmem-linux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.23"
+libc = "0.2"
+thiserror = "2.0"
