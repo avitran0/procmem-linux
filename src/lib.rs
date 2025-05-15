@@ -1,40 +1,15 @@
 use std::{
     fs::{File, OpenOptions, read_dir, read_link},
     io::{BufRead, BufReader, Error, ErrorKind},
-    num::IntErrorKind,
     os::unix::fs::FileExt,
     path::Path,
 };
 
 use bytemuck::{AnyBitPattern, NoUninit};
+use error::{MemoryError, ProcessError};
 use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv, process_vm_writev};
-use thiserror::Error;
 
-#[derive(Error, Debug)]
-pub enum ProcessError {
-    #[error("the requested process could not be found")]
-    NotFound,
-    #[error("the pid of the requested process is not valid")]
-    InvalidPid(IntErrorKind),
-    #[error("permission to open /proc/{0}/mem was denied")]
-    PermissionDenied(i32),
-    #[error("failed to open /proc/{0}/mem")]
-    FileOpenError(i32),
-}
-
-#[derive(Error, Debug)]
-pub enum MemoryError {
-    #[error("the requested address is out of range")]
-    OutOfRange,
-    #[error("the process has quit")]
-    ProcessQuit,
-    #[error("permission to memory was denied")]
-    PermissionDenied,
-    #[error("data could not be parsed to type {0}")]
-    InvalidData(&'static str),
-    #[error("unknown read error")]
-    Unknown,
-}
+pub mod error;
 
 #[derive(PartialEq)]
 enum MemoryMode {
@@ -42,6 +17,7 @@ enum MemoryMode {
     Syscall,
 }
 
+/// representation of a process to read/write memory to.
 pub struct Process {
     pid: i32,
     memory: File,
@@ -95,11 +71,13 @@ impl Process {
         Err(ProcessError::NotFound)
     }
 
-    pub fn open_name(name: &str) -> Result<Process, ProcessError> {
+    /// open a process given its executable name.
+    pub fn open_exe_name(name: &str) -> Result<Process, ProcessError> {
         let pid = Process::find_pid(name)?;
         Process::open_pid(pid)
     }
 
+    /// open a process from its pid.
     pub fn open_pid(pid: i32) -> Result<Process, ProcessError> {
         // test whether process_vm_readv is a valid syscall
         // call it with dummy data and see what happens
@@ -138,6 +116,7 @@ impl Process {
         })
     }
 
+    /// whether the opened process is still running and valid
     pub fn is_running(&self) -> bool {
         Path::new(&format!("/proc/{}/mem", self.pid)).exists()
     }
@@ -146,6 +125,7 @@ impl Process {
         self.pid
     }
 
+    /// read a value from an address
     pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, MemoryError> {
         let mut buffer = vec![0u8; std::mem::size_of::<T>()];
         if self.mode == MemoryMode::File {
@@ -185,6 +165,7 @@ impl Process {
         }
     }
 
+    /// write a value to an address
     pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
         let mut buffer = bytemuck::bytes_of(value).to_vec();
         if self.mode == MemoryMode::File {
@@ -244,7 +225,31 @@ impl Process {
         Ok(())
     }
 
-    /// tries to find the address of a library loaded into the process
+    /// reads a null-terminated string.
+    pub fn read_terminated_string(&self, address: usize) -> Result<String, MemoryError> {
+        let mut value = String::with_capacity(8);
+        let mut i = address;
+        loop {
+            let c = self.read::<u8>(i)?;
+            if c == 0 {
+                break;
+            }
+            value.push(c as char);
+            i += 1;
+        }
+        Ok(value)
+    }
+
+    /// reads a string with a given length.
+    pub fn read_string(&self, address: usize, length: usize) -> Result<String, MemoryError> {
+        let bytes = self.read_bytes(address, length)?;
+        match String::from_utf8(bytes) {
+            Ok(str) => Ok(str),
+            Err(_) => Err(MemoryError::InvalidData(std::any::type_name::<String>())),
+        }
+    }
+
+    /// tries to find the address of a library loaded into the process.
     pub fn find_library(&self, library: &str) -> Option<usize> {
         let maps = File::open(format!("/proc/{}/maps", self.pid)).unwrap();
         for line in BufReader::new(maps).lines() {
