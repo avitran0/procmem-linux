@@ -12,7 +12,7 @@ use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv, process_vm_writev};
 pub mod error;
 
 #[derive(PartialEq)]
-enum MemoryMode {
+pub enum MemoryMode {
     File,
     Syscall,
 }
@@ -114,6 +114,10 @@ impl Process {
                 MemoryMode::File
             },
         })
+    }
+
+    pub fn set_mode(&mut self, mode: MemoryMode) {
+        self.mode = mode;
     }
 
     /// whether the opened process is still running and valid
