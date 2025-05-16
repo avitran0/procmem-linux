@@ -26,6 +26,8 @@ pub enum MemoryError {
     PermissionDenied,
     #[error("data could not be parsed to type {0}")]
     InvalidData(&'static str),
+    #[error("only {0} out of {1} bytes could be transferred")]
+    PartialTransfer(usize, usize),
     #[error("library at given address is not valid")]
     LibraryNotValid,
     #[error("pattern was not found")]

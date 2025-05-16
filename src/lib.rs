@@ -41,7 +41,7 @@ impl Process {
 
             match entry.file_type() {
                 Ok(file_type) => {
-                    if file_type.is_dir() {
+                    if !file_type.is_dir() {
                         continue;
                     }
                 }
@@ -180,6 +180,11 @@ impl Process {
                     Some(EPERM) => MemoryError::PermissionDenied,
                     _ => MemoryError::Unknown,
                 });
+            } else if (bytes_read as usize) < buffer.len() {
+                return Err(MemoryError::PartialTransfer(
+                    bytes_read as usize,
+                    buffer.len(),
+                ));
             }
         }
 
@@ -223,6 +228,11 @@ impl Process {
                     Some(EPERM) => MemoryError::PermissionDenied,
                     _ => MemoryError::Unknown,
                 });
+            } else if (bytes_written as usize) < buffer.len() {
+                return Err(MemoryError::PartialTransfer(
+                    bytes_written as usize,
+                    buffer.len(),
+                ));
             }
         }
 
@@ -267,13 +277,15 @@ impl Process {
     pub fn read_terminated_string(&self, address: usize) -> Result<String, MemoryError> {
         let mut value = String::with_capacity(8);
         let mut i = address;
-        loop {
-            let c = self.read::<u8>(i)?;
-            if c == 0 {
-                break;
+        'outer: loop {
+            let chars = self.read::<u64>(i)?;
+            for c in chars.to_ne_bytes() {
+                if c == 0 {
+                    break 'outer;
+                }
+                value.push(c as char);
             }
-            value.push(c as char);
-            i += 1;
+            i += std::mem::size_of::<u64>();
         }
         Ok(value)
     }
@@ -301,7 +313,11 @@ impl Process {
                 Ok(line) => line,
                 Err(_) => continue,
             };
-            if !line.contains(library.as_ref()) {
+            let (line, file_name) = match line.rsplit_once('/') {
+                Some(x) => x,
+                None => continue,
+            };
+            if !file_name.contains(library.as_ref()) {
                 continue;
             }
             let (address, _) = match line.split_once('-') {
@@ -319,6 +335,11 @@ impl Process {
 
     /// returns the size of a library at `address`, in bytes.
     pub fn library_size(&self, address: usize) -> Result<usize, MemoryError> {
+        // check if elf header is present
+        let header = self.read::<u32>(address)?;
+        if header != 0x7F454C46 && header != 0x464C457F {
+            return Err(MemoryError::OutOfRange);
+        }
         let section_header_offset = self.read::<usize>(address + elf::SECTION_HEADER_OFFSET)?;
         let section_header_entry_size =
             self.read::<u16>(address + elf::SECTION_HEADER_ENTRY_SIZE)? as usize;
@@ -331,6 +352,11 @@ impl Process {
     /// dump a library at base address `address`.
     /// this will return a complete copy of the library, as it is loaded into memory.
     pub fn dump_library(&self, address: usize) -> Result<Vec<u8>, MemoryError> {
+        // check if elf header is present
+        let header = self.read::<u32>(address)?;
+        if header != 0x7F454C46 && header != 0x464C457F {
+            return Err(MemoryError::OutOfRange);
+        }
         let lib_size = self.library_size(address)?;
         self.read_bytes(address, lib_size)
     }
@@ -390,6 +416,8 @@ impl Process {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::MemoryError;
+
     use super::Process;
 
     /// get own process pid.
@@ -403,73 +431,71 @@ mod tests {
     }
 
     #[test]
-    fn read() {
+    fn read() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer = [0x55u8];
-        let value = process.read::<u8>(buffer.as_ptr() as usize).unwrap();
+        let value = process.read::<u8>(buffer.as_ptr() as usize)?;
         assert!(value == buffer[0]);
+        Ok(())
     }
 
     #[test]
-    fn write() {
+    fn write() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer = [0x55u8];
         const VALUE: u8 = 0x66;
-        process
-            .write::<u8>(buffer.as_ptr() as usize, &VALUE)
-            .unwrap();
+        process.write::<u8>(buffer.as_ptr() as usize, &VALUE)?;
         assert!(buffer[0] == VALUE);
+        Ok(())
     }
 
     #[test]
-    fn read_bytes() {
+    fn read_bytes() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
-        let value = process.read_bytes(buffer.as_ptr() as usize, 4).unwrap();
+        let value = process.read_bytes(buffer.as_ptr() as usize, 4)?;
         assert!(value == buffer);
+        Ok(())
     }
 
     #[test]
-    fn write_bytes() {
+    fn write_bytes() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
         const VALUE: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
-        process
-            .write_bytes(buffer.as_ptr() as usize, &VALUE)
-            .unwrap();
+        process.write_bytes(buffer.as_ptr() as usize, &VALUE)?;
         assert!(buffer == VALUE);
+        Ok(())
     }
 
     #[test]
-    fn read_terminated_string() {
+    fn read_terminated_string() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         const STRING: &str = "Hello World";
         let buffer = std::ffi::CString::new(STRING).unwrap();
-        let value = process
-            .read_terminated_string(buffer.as_ptr() as usize)
-            .unwrap();
+        let value = process.read_terminated_string(buffer.as_ptr() as usize)?;
         assert!(value == *STRING);
+        Ok(())
     }
 
     #[test]
-    fn read_string() {
+    fn read_string() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer = "Hello World";
-        let value = process
-            .read_string(buffer.as_ptr() as usize, buffer.len())
-            .unwrap();
+        let value = process.read_string(buffer.as_ptr() as usize, buffer.len())?;
         assert!(value == buffer);
+        Ok(())
     }
 
     #[test]
-    fn scan_pattern() {
+    fn scan_pattern() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer = "Hello World";
 
         // find loaded process elf
         let exe_path = std::env::current_exe().unwrap();
         let exe_name = exe_path.file_name().unwrap().to_str().unwrap();
-        let lib = process.find_library(exe_name).unwrap();
+        let lib = process.find_library(exe_name)?;
 
         // convert hello world string to ida pattern
         let pattern = buffer
@@ -479,7 +505,8 @@ mod tests {
             .collect::<Vec<String>>()
             .join(" ");
 
-        let value = process.scan_pattern(pattern, lib).unwrap();
+        let value = process.scan_pattern(pattern, lib)?;
         assert!(value == buffer.as_ptr() as usize);
+        Ok(())
     }
 }
