@@ -5,7 +5,7 @@ a library to read and write process memory on linux
 ## features
 
 - locate processes by executable name or pid
-- read/write any type that implements [`bytemuck::AnyBitPattern`](https://docs.rs/bytemuck/latest/bytemuck/trait.AnyBitPattern.html) (reads) and [`bytemuck::NoUninit`](https://docs.rs/bytemuck/latest/bytemuck/trait.NoUninit.html) (writes) from bytemuck
+- read/write any type that implements [`bytemuck::AnyBitPattern`](https://docs.rs/bytemuck/latest/bytemuck/trait.AnyBitPattern.html) (reads) and [`bytemuck::NoUninit`](https://docs.rs/bytemuck/latest/bytemuck/trait.NoUninit.html) (writes)
 - read c-style null terminated and fixed-length strings
 - read/write arbitrary bite slices
 - find base addresses of loaded libraries
@@ -33,6 +33,13 @@ fn main() -> Result<(), MemoryError> {
     let message = proc.read_terminated_string(0x7ffd_1234_9000)?;
     println!("message: {}", message);
 
+    // write a string
+    proc.write_string(0x7ffd_1234_5678, "Hello World")?;
+
+    // scan an ida pattern ("Hello World", with two wildcards)
+    let pattern = proc.scan_pattern("48 65 ? ? 6f 20 57 6f 72 6c 64", 0x7ffd_1234_5678)?;
+    println!("pattern address: {}", pattern);
+
     Ok(())
 }
 ```
@@ -42,7 +49,7 @@ fn main() -> Result<(), MemoryError> {
 the crate works in two different modes: `Syscall` and `File` mode.
 
 in **Syscall mode**, it tries to use `process_vm_readv` and `process_vm_writev` to avoid copies and avoid detection.
-this needs the `kernel >= 3.2` and `glibc >= 2.15`.
+this requires `kernel >= 3.2` and `glibc >= 2.15`.
 
 in **File mode**, it opens `/proc/{pid}/mem` and uses normal read/write syscalls.
 this is slower, but might be necessary as a fallback, or when write permissions are restricted.

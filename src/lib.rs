@@ -12,6 +12,7 @@ use error::{MemoryError, ProcessError};
 use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv, process_vm_writev};
 
 mod elf;
+/// errors for process handling and memory operations
 pub mod error;
 
 /// mode used to read and write memory.
@@ -146,6 +147,7 @@ impl Process {
     }
 
     /// read a value T from the specified address.
+    ///
     /// the type must implement [`bytemuck::AnyBitPattern`].
     /// in Syscall mode uses `process_vm_readv`, in File mode uses FileExt::read_at.
     pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, MemoryError> {
@@ -188,6 +190,7 @@ impl Process {
     }
 
     /// write a value T to the specified address.
+    ///
     /// the type must implement [`bytemuck::NoUninit`].
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
     pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
@@ -227,6 +230,7 @@ impl Process {
     }
 
     /// reads `count` bytes starting at `address`, using File mode.
+    ///
     /// process_vm_readv does not work for very large reads,
     /// which is why File mode is always used.
     /// it will not switch the mode for other reads and writes.
@@ -243,6 +247,7 @@ impl Process {
     }
 
     /// writes `count` bytes starting at `address`, using File mode.
+    ///
     /// process_vm_writev does not work for very large writes,
     /// which is why File mode is always used.
     /// it will not switch the mode for other reads and writes.
@@ -282,23 +287,34 @@ impl Process {
         }
     }
 
+    /// writes any string-like starting at `address`
+    pub fn write_string<S: AsRef<str>>(&self, address: usize, value: S) -> Result<(), MemoryError> {
+        self.write_bytes(address, value.as_ref().as_bytes())
+    }
+
     /// parses `/proc/{pid}/maps` to locate the base address of a loaded
     /// library with name matching `library`.
-    pub fn find_library<S: AsRef<str>>(&self, library: S) -> Option<usize> {
+    pub fn find_library<S: AsRef<str>>(&self, library: S) -> Result<usize, MemoryError> {
         let maps = File::open(format!("/proc/{}/maps", self.pid)).unwrap();
         for line in BufReader::new(maps).lines() {
-            if line.is_err() {
-                continue;
-            }
-            let line = line.unwrap();
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
             if !line.contains(library.as_ref()) {
                 continue;
             }
-            let (address, _) = line.split_once('-').unwrap();
-            let address = usize::from_str_radix(address, 16).unwrap();
-            return Some(address);
+            let (address, _) = match line.split_once('-') {
+                Some(addr) => addr,
+                None => return Err(MemoryError::Unknown),
+            };
+            let address = match usize::from_str_radix(address, 16) {
+                Ok(addr) => addr,
+                Err(_) => return Err(MemoryError::InvalidData(std::any::type_name::<usize>())),
+            };
+            return Ok(address);
         }
-        None
+        Err(MemoryError::NotFound)
     }
 
     /// returns the size of a library at `address`, in bytes.
@@ -443,5 +459,27 @@ mod tests {
             .read_string(buffer.as_ptr() as usize, buffer.len())
             .unwrap();
         assert!(value == buffer);
+    }
+
+    #[test]
+    fn scan_pattern() {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer = "Hello World";
+
+        // find loaded process elf
+        let exe_path = std::env::current_exe().unwrap();
+        let exe_name = exe_path.file_name().unwrap().to_str().unwrap();
+        let lib = process.find_library(exe_name).unwrap();
+
+        // convert hello world string to ida pattern
+        let pattern = buffer
+            .as_bytes()
+            .iter()
+            .map(|c| format!("{:02x}", c))
+            .collect::<Vec<String>>()
+            .join(" ");
+
+        let value = process.scan_pattern(pattern, lib).unwrap();
+        assert!(value == buffer.as_ptr() as usize);
     }
 }
