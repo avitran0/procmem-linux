@@ -1,5 +1,9 @@
 # procmem-linux
 
+[![crates.io](https://img.shields.io/crates/v/procmem-linux
+)](https://crates.io/crates/procmem-linux)
+[![docs.rs](https://img.shields.io/docsrs/procmem-linux)](https://docs.rs/procmem-linux)
+
 a library to read and write process memory on linux
 
 ## features

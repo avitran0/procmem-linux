@@ -10,6 +10,6 @@ repository = "https://github.com/avitran0/procmem-linux"
 readme = "readme.md"
 
 [dependencies]
-bytemuck = "1.23"
+bytemuck = "1"
 libc = "0.2"
-thiserror = "2.0"
+thiserror = "2"
