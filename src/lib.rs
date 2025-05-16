@@ -274,7 +274,7 @@ impl Process {
 
             if let Some(null_pos) = chunk.iter().position(|&b| b == 0) {
                 buffer.extend_from_slice(&chunk[..null_pos]);
-                return Ok(String::from_utf8_lossy(&buffer).to_string());
+                return String::from_utf8(buffer).map_err(|_| MemoryError::InvalidString);
             }
 
             buffer.extend_from_slice(&chunk);
@@ -289,8 +289,7 @@ impl Process {
     /// reads a utf-8 encoded string starting at `address` with a given length.
     pub fn read_string(&self, address: usize, length: usize) -> Result<String, MemoryError> {
         let bytes = self.read_bytes(address, length)?;
-        String::from_utf8(bytes)
-            .map_err(|_| MemoryError::InvalidData(std::any::type_name::<String>()))
+        String::from_utf8(bytes).map_err(|_| MemoryError::InvalidString)
     }
 
     /// writes any string-like starting at `address`

@@ -32,6 +32,8 @@ pub enum MemoryError {
     InvalidLibrary,
     #[error("c-style string was too long")]
     StringTooLong,
+    #[error("string is not valid utf-8")]
+    InvalidString,
     #[error("pattern was not found")]
     NotFound,
     #[error("unknown read error")]
