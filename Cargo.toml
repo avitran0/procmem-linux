@@ -8,6 +8,8 @@ description = "read and write process memory on linux"
 homepage = "https://github.com/avitran0/procmem-linux"
 repository = "https://github.com/avitran0/procmem-linux"
 readme = "readme.md"
+keywords = ["memory", "debugging", "linux"]
+categories = ["os::linux-apis", "memory-management", "security"]
 
 [dependencies]
 bytemuck = "1"
