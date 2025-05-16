@@ -29,7 +29,9 @@ pub enum MemoryError {
     #[error("only {0} out of {1} bytes could be transferred")]
     PartialTransfer(usize, usize),
     #[error("library at given address is not valid")]
-    LibraryNotValid,
+    InvalidLibrary,
+    #[error("c-style string was too long")]
+    StringTooLong,
     #[error("pattern was not found")]
     NotFound,
     #[error("unknown read error")]

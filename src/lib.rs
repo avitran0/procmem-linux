@@ -68,14 +68,21 @@ impl Process {
             };
 
             if exe_name == name.as_ref() {
-                let pid = match pid.parse::<i32>() {
-                    Ok(pid) => pid,
-                    Err(error) => return Err(ProcessError::InvalidPid(error.kind().clone())),
-                };
+                let pid = pid
+                    .parse::<i32>()
+                    .map_err(|error| ProcessError::InvalidPid(error.kind().clone()))?;
                 return Ok(pid);
             }
         }
         Err(ProcessError::NotFound)
+    }
+
+    fn map_mem_error(error: Error) -> MemoryError {
+        if error.kind() == ErrorKind::PermissionDenied {
+            MemoryError::PermissionDenied
+        } else {
+            MemoryError::Unknown
+        }
     }
 
     /// open a process given its executable name.
@@ -105,20 +112,17 @@ impl Process {
 
         let has_proc_read = unsafe { process_vm_readv(pid, &iov, 1, &iov, 1, 0) } > 0;
 
-        let memory = match OpenOptions::new()
+        let memory = OpenOptions::new()
             .read(true)
             .write(true)
             .open(format!("/proc/{pid}/mem"))
-        {
-            Ok(memory) => memory,
-            Err(error) => {
+            .map_err(|error| {
                 if error.kind() == ErrorKind::PermissionDenied {
-                    return Err(ProcessError::PermissionDenied(pid));
+                    ProcessError::PermissionDenied(pid)
                 } else {
-                    return Err(ProcessError::FileOpenError(pid));
+                    ProcessError::FileOpenError(pid)
                 }
-            }
-        };
+            })?;
 
         Ok(Process {
             pid,
@@ -153,13 +157,9 @@ impl Process {
     pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, MemoryError> {
         let mut buffer = vec![0u8; std::mem::size_of::<T>()];
         if self.mode == MemoryMode::File {
-            if let Err(error) = &self.memory.read_at(&mut buffer, address as u64) {
-                return Err(if error.kind() == ErrorKind::PermissionDenied {
-                    MemoryError::PermissionDenied
-                } else {
-                    MemoryError::Unknown
-                });
-            }
+            self.memory
+                .read_at(&mut buffer, address as u64)
+                .map_err(Process::map_mem_error)?;
         } else {
             let local_iov = iovec {
                 iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
@@ -201,13 +201,9 @@ impl Process {
     pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
         let mut buffer = bytemuck::bytes_of(value).to_vec();
         if self.mode == MemoryMode::File {
-            if let Err(error) = &self.memory.write_at(&buffer, address as u64) {
-                return Err(if error.kind() == ErrorKind::PermissionDenied {
-                    MemoryError::PermissionDenied
-                } else {
-                    MemoryError::Unknown
-                });
-            }
+            self.memory
+                .write_at(&buffer, address as u64)
+                .map_err(Process::map_mem_error)?;
         } else {
             let local_iov = iovec {
                 iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
@@ -246,13 +242,9 @@ impl Process {
     /// it will not switch the mode for other reads and writes.
     pub fn read_bytes(&self, address: usize, count: usize) -> Result<Vec<u8>, MemoryError> {
         let mut buffer = vec![0u8; count];
-        if let Err(error) = self.memory.read_at(&mut buffer, address as u64) {
-            return Err(if error.kind() == ErrorKind::PermissionDenied {
-                MemoryError::PermissionDenied
-            } else {
-                MemoryError::Unknown
-            });
-        }
+        self.memory
+            .read_at(&mut buffer, address as u64)
+            .map_err(Process::map_mem_error)?;
         Ok(buffer)
     }
 
@@ -262,41 +254,43 @@ impl Process {
     /// which is why File mode is always used.
     /// it will not switch the mode for other reads and writes.
     pub fn write_bytes(&self, address: usize, value: &[u8]) -> Result<(), MemoryError> {
-        if let Err(error) = self.memory.write_at(value, address as u64) {
-            return Err(if error.kind() == ErrorKind::PermissionDenied {
-                MemoryError::PermissionDenied
-            } else {
-                MemoryError::Unknown
-            });
-        }
+        self.memory
+            .write_at(value, address as u64)
+            .map_err(Process::map_mem_error)?;
         Ok(())
     }
 
     /// reads a c-style null-terminated string starting at `address`
     /// until a `0` byte.
     pub fn read_terminated_string(&self, address: usize) -> Result<String, MemoryError> {
-        let mut value = String::with_capacity(8);
-        let mut i = address;
-        'outer: loop {
-            let chars = self.read::<u64>(i)?;
-            for c in chars.to_ne_bytes() {
-                if c == 0 {
-                    break 'outer;
-                }
-                value.push(c as char);
+        const MAX_BYTES: usize = 1024;
+        const SIZE: usize = 32;
+        let mut buffer = Vec::with_capacity(SIZE);
+        let mut current_address = address;
+        let mut bytes_read = 0;
+        loop {
+            let chunk = self.read_bytes(current_address, SIZE)?;
+            bytes_read += SIZE;
+
+            if let Some(null_pos) = chunk.iter().position(|&b| b == 0) {
+                buffer.extend_from_slice(&chunk[..null_pos]);
+                return Ok(String::from_utf8_lossy(&buffer).to_string());
             }
-            i += std::mem::size_of::<u64>();
+
+            buffer.extend_from_slice(&chunk);
+            current_address += SIZE;
+
+            if bytes_read >= MAX_BYTES {
+                return Err(MemoryError::StringTooLong);
+            }
         }
-        Ok(value)
     }
 
     /// reads a utf-8 encoded string starting at `address` with a given length.
     pub fn read_string(&self, address: usize, length: usize) -> Result<String, MemoryError> {
         let bytes = self.read_bytes(address, length)?;
-        match String::from_utf8(bytes) {
-            Ok(str) => Ok(str),
-            Err(_) => Err(MemoryError::InvalidData(std::any::type_name::<String>())),
-        }
+        String::from_utf8(bytes)
+            .map_err(|_| MemoryError::InvalidData(std::any::type_name::<String>()))
     }
 
     /// writes any string-like starting at `address`
@@ -307,27 +301,23 @@ impl Process {
     /// parses `/proc/{pid}/maps` to locate the base address of a loaded
     /// library with name matching `library`.
     pub fn find_library<S: AsRef<str>>(&self, library: S) -> Result<usize, MemoryError> {
-        let maps = File::open(format!("/proc/{}/maps", self.pid)).unwrap();
+        let maps =
+            File::open(format!("/proc/{}/maps", self.pid)).map_err(Process::map_mem_error)?;
         for line in BufReader::new(maps).lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => continue,
+            let Ok(line) = line else {
+                continue;
             };
-            let (line, file_name) = match line.rsplit_once('/') {
-                Some(x) => x,
-                None => continue,
+            let Some((line, file_name)) = line.rsplit_once('/') else {
+                continue;
             };
             if !file_name.contains(library.as_ref()) {
                 continue;
             }
-            let (address, _) = match line.split_once('-') {
-                Some(addr) => addr,
-                None => return Err(MemoryError::Unknown),
+            let Some((address, _)) = line.split_once('-') else {
+                return Err(MemoryError::Unknown);
             };
-            let address = match usize::from_str_radix(address, 16) {
-                Ok(addr) => addr,
-                Err(_) => return Err(MemoryError::InvalidData(std::any::type_name::<usize>())),
-            };
+            let address = usize::from_str_radix(address, 16)
+                .map_err(|_| MemoryError::InvalidData(std::any::type_name::<usize>()))?;
             return Ok(address);
         }
         Err(MemoryError::NotFound)
@@ -337,7 +327,7 @@ impl Process {
     pub fn library_size(&self, address: usize) -> Result<usize, MemoryError> {
         // check if elf header is present
         let header = self.read::<u32>(address)?;
-        if header != 0x7F454C46 && header != 0x464C457F {
+        if header != 0x464C457F && header != 0x7F454C46 {
             return Err(MemoryError::OutOfRange);
         }
         let section_header_offset = self.read::<usize>(address + elf::SECTION_HEADER_OFFSET)?;
@@ -354,7 +344,7 @@ impl Process {
     pub fn dump_library(&self, address: usize) -> Result<Vec<u8>, MemoryError> {
         // check if elf header is present
         let header = self.read::<u32>(address)?;
-        if header != 0x7F454C46 && header != 0x464C457F {
+        if header != 0x464C457F && header != 0x7F454C46 {
             return Err(MemoryError::OutOfRange);
         }
         let lib_size = self.library_size(address)?;
@@ -397,7 +387,7 @@ impl Process {
 
         let module = self.dump_library(address)?;
         if module.len() < 500 {
-            return Err(MemoryError::LibraryNotValid);
+            return Err(MemoryError::InvalidLibrary);
         }
 
         let pattern_length = pattern.len();
@@ -481,16 +471,16 @@ mod tests {
     #[test]
     fn read_string() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
-        let buffer = "Hello World";
-        let value = process.read_string(buffer.as_ptr() as usize, buffer.len())?;
-        assert!(value == buffer);
+        const STRING: &str = "Hello World";
+        let value = process.read_string(STRING.as_ptr() as usize, STRING.len())?;
+        assert!(value == STRING);
         Ok(())
     }
 
     #[test]
     fn scan_pattern() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
-        let buffer = "Hello World";
+        const STRING: &str = "Hello World";
 
         // find loaded process elf
         let exe_path = std::env::current_exe().unwrap();
@@ -498,7 +488,7 @@ mod tests {
         let lib = process.find_library(exe_name)?;
 
         // convert hello world string to ida pattern
-        let pattern = buffer
+        let pattern = STRING
             .as_bytes()
             .iter()
             .map(|c| format!("{:02x}", c))
@@ -506,7 +496,7 @@ mod tests {
             .join(" ");
 
         let value = process.scan_pattern(pattern, lib)?;
-        assert!(value == buffer.as_ptr() as usize);
+        assert!(value == STRING.as_ptr() as usize);
         Ok(())
     }
 }
