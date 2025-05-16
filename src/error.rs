@@ -26,6 +26,10 @@ pub enum MemoryError {
     PermissionDenied,
     #[error("data could not be parsed to type {0}")]
     InvalidData(&'static str),
+    #[error("library at given address is not valid")]
+    LibraryNotValid,
+    #[error("pattern was not found")]
+    NotFound,
     #[error("unknown read error")]
     Unknown,
 }

@@ -2,22 +2,52 @@
 
 a library to read and write process memory on linux
 
-## example
+## features
+
+- locate processes by executable name or pid
+- read/write any type that implements [`bytemuck::AnyBitPattern`](https://docs.rs/bytemuck/latest/bytemuck/trait.AnyBitPattern.html) (reads) and [`bytemuck::NoUninit`](https://docs.rs/bytemuck/latest/bytemuck/trait.NoUninit.html) (writes) from bytemuck
+- read c-style null terminated and fixed-length strings
+- read/write arbitrary bite slices
+- find base addresses of loaded libraries
+
+## quick start
 
 ```rust
-use procmem_linux::{Process};
+use process_memory::{Process, MemoryMode, error::MemoryError};
 
-// open a process by its pid
-let process = Process::open_pid(1234).unwrap();
-// open a process by its executable name (first that is found with matching name)
-let process = Process::open_exe_name("executable");
+fn main() -> Result<(), MemoryError> {
+    // open a process by name or pid
+    let mut proc = Process::open_exe_name("target_executable")?;
 
-// read a value from a given address
-let read_value: i32 = process.read(0x1234);
+    // optionally switch to file-based mode
+    proc.set_mode(MemoryMode::File);
+
+    // read a value of type T at a given address
+    let value: u32 = proc.read(0x7ffd_1234_5678)?;
+    println!("value at address: {}", value);
+
+    // write a new value
+    proc.write(0x7ffd_1234_5678, &42u32)?;
+
+    // read a null-terminated string
+    let message = proc.read_terminated_string(0x7ffd_1234_9000)?;
+    println!("message: {}", message);
+
+    Ok(())
+}
 ```
 
-by default, it tries to read and write memory using the `process_vm_readv/writev` syscalls,
-but it can be forced to read from `/proc/{pid}/mem` by changing the process mode:
+## memory mode
+
+the crate works in two different modes: `Syscall` and `File` mode.
+
+in **Syscall mode**, it tries to use `process_vm_readv` and `process_vm_writev` to avoid copies and avoid detection.
+this needs the `kernel >= 3.2` and `glibc >= 2.15`.
+
+in **File mode**, it opens `/proc/{pid}/mem` and uses normal read/write syscalls.
+this is slower, but might be necessary as a fallback, or when write permissions are restricted.
+
+the default mode is to try and use syscall mode, but this can be overridden if wanted:
 
 ```rust
 use procmem_linux::{Process, MemoryMode};
