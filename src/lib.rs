@@ -150,15 +150,11 @@ impl Process {
         self.pid
     }
 
-    /// read a value T from the specified address.
-    ///
-    /// the type must implement [`bytemuck::AnyBitPattern`].
-    /// in Syscall mode uses `process_vm_readv`, in File mode uses FileExt::read_at.
-    pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, MemoryError> {
-        let mut buffer = vec![0u8; std::mem::size_of::<T>()];
+    #[inline]
+    fn read_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         if self.mode == MemoryMode::File {
             self.memory
-                .read_at(&mut buffer, address as u64)
+                .read_at(buffer, address as u64)
                 .map_err(Process::map_mem_error)?;
         } else {
             let local_iov = iovec {
@@ -187,6 +183,17 @@ impl Process {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// read a value T from the specified address.
+    ///
+    /// the type must implement [`bytemuck::AnyBitPattern`].
+    /// in Syscall mode uses `process_vm_readv`, in File mode uses FileExt::read_at.
+    pub fn read<T: AnyBitPattern>(&self, address: usize) -> Result<T, MemoryError> {
+        let mut buffer = vec![0u8; std::mem::size_of::<T>()];
+
+        self.read_impl(&mut buffer, address)?;
 
         match bytemuck::try_from_bytes::<T>(&buffer).cloned() {
             Ok(value) => Ok(value),
@@ -204,37 +211,8 @@ impl Process {
         count: usize,
     ) -> Result<Vec<T>, MemoryError> {
         let mut buffer = vec![0u8; std::mem::size_of::<T>() * count];
-        if self.mode == MemoryMode::File {
-            self.memory
-                .read_at(&mut buffer, address as u64)
-                .map_err(Process::map_mem_error)?;
-        } else {
-            let local_iov = iovec {
-                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-            let remote_iov = iovec {
-                iov_base: address as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
 
-            let bytes_read =
-                unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
-            if bytes_read < 0 {
-                let os_error = Error::last_os_error().raw_os_error();
-                return Err(match os_error {
-                    Some(EFAULT) => MemoryError::OutOfRange,
-                    Some(ESRCH) => MemoryError::ProcessQuit,
-                    Some(EPERM) => MemoryError::PermissionDenied,
-                    _ => MemoryError::Unknown,
-                });
-            } else if (bytes_read as usize) < buffer.len() {
-                return Err(MemoryError::PartialTransfer(
-                    bytes_read as usize,
-                    buffer.len(),
-                ));
-            }
-        }
+        self.read_impl(&mut buffer, address)?;
 
         let slice: &[T] = match bytemuck::try_cast_slice(&buffer) {
             Ok(value) => Ok(value),
@@ -243,15 +221,11 @@ impl Process {
         Ok(slice.to_vec())
     }
 
-    /// write a value T to the specified address.
-    ///
-    /// the type must implement [`bytemuck::NoUninit`].
-    /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
-    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
-        let mut buffer = bytemuck::bytes_of(value).to_vec();
+    #[inline]
+    fn write_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         if self.mode == MemoryMode::File {
             self.memory
-                .write_at(&buffer, address as u64)
+                .write_at(buffer, address as u64)
                 .map_err(Process::map_mem_error)?;
         } else {
             let local_iov = iovec {
@@ -280,7 +254,16 @@ impl Process {
                 ));
             }
         }
+        Ok(())
+    }
 
+    /// write a value T to the specified address.
+    ///
+    /// the type must implement [`bytemuck::NoUninit`].
+    /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
+    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
+        let mut buffer = bytemuck::bytes_of(value).to_vec();
+        self.write_impl(&mut buffer, address)?;
         Ok(())
     }
 
@@ -290,38 +273,7 @@ impl Process {
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
     pub fn write_vec<T: NoUninit>(&self, address: usize, value: &[T]) -> Result<(), MemoryError> {
         let mut buffer = bytemuck::cast_slice(value).to_vec();
-        if self.mode == MemoryMode::File {
-            self.memory
-                .write_at(&buffer, address as u64)
-                .map_err(Process::map_mem_error)?;
-        } else {
-            let local_iov = iovec {
-                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-            let remote_iov = iovec {
-                iov_base: address as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-
-            let bytes_written =
-                unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
-            if bytes_written < 0 {
-                let os_error = Error::last_os_error().raw_os_error();
-                return Err(match os_error {
-                    Some(EFAULT) => MemoryError::OutOfRange,
-                    Some(ESRCH) => MemoryError::ProcessQuit,
-                    Some(EPERM) => MemoryError::PermissionDenied,
-                    _ => MemoryError::Unknown,
-                });
-            } else if (bytes_written as usize) < buffer.len() {
-                return Err(MemoryError::PartialTransfer(
-                    bytes_written as usize,
-                    buffer.len(),
-                ));
-            }
-        }
-
+        self.write_impl(&mut buffer, address)?;
         Ok(())
     }
 
@@ -514,7 +466,7 @@ mod tests {
         let process = Process::open_pid(pid()).unwrap();
         let buffer = [0x55u8];
         let value = process.read::<u8>(buffer.as_ptr() as usize)?;
-        assert!(value == buffer[0]);
+        assert_eq!(value, buffer[0]);
         Ok(())
     }
 
@@ -534,7 +486,7 @@ mod tests {
         let buffer = [0x55u8];
         const VALUE: u8 = 0x66;
         process.write::<u8>(buffer.as_ptr() as usize, &VALUE)?;
-        assert!(buffer[0] == VALUE);
+        assert_eq!(buffer[0], VALUE);
         Ok(())
     }
 
@@ -554,7 +506,7 @@ mod tests {
         let process = Process::open_pid(pid()).unwrap();
         let buffer: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
         let value = process.read_bytes(buffer.as_ptr() as usize, 4)?;
-        assert!(value == buffer);
+        assert_eq!(value, buffer);
         Ok(())
     }
 
@@ -564,7 +516,7 @@ mod tests {
         let buffer: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
         const VALUE: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
         process.write_bytes(buffer.as_ptr() as usize, &VALUE)?;
-        assert!(buffer == VALUE);
+        assert_eq!(buffer, VALUE);
         Ok(())
     }
 
@@ -574,7 +526,7 @@ mod tests {
         const STRING: &str = "Hello World";
         let buffer = std::ffi::CString::new(STRING).unwrap();
         let value = process.read_terminated_string(buffer.as_ptr() as usize)?;
-        assert!(value == *STRING);
+        assert_eq!(value, *STRING);
         Ok(())
     }
 
@@ -583,7 +535,7 @@ mod tests {
         let process = Process::open_pid(pid()).unwrap();
         const STRING: &str = "Hello World";
         let value = process.read_string(STRING.as_ptr() as usize, STRING.len())?;
-        assert!(value == STRING);
+        assert_eq!(value, STRING);
         Ok(())
     }
 
@@ -606,7 +558,7 @@ mod tests {
             .join(" ");
 
         let value = process.scan_pattern(pattern, lib)?;
-        assert!(value == STRING.as_ptr() as usize);
+        assert_eq!(value, STRING.as_ptr() as usize);
         Ok(())
     }
 }
