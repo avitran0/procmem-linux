@@ -194,12 +194,102 @@ impl Process {
         }
     }
 
+    /// read a vec of T with `count` elements from the specified address.
+    ///
+    /// the type must implement [`bytemuck::AnyBitPattern`].
+    /// in Syscall mode uses `process_vm_readv`, in File mode uses FileExt::read_at.
+    pub fn read_vec<T: AnyBitPattern>(
+        &self,
+        address: usize,
+        count: usize,
+    ) -> Result<Vec<T>, MemoryError> {
+        let mut buffer = vec![0u8; std::mem::size_of::<T>() * count];
+        if self.mode == MemoryMode::File {
+            self.memory
+                .read_at(&mut buffer, address as u64)
+                .map_err(Process::map_mem_error)?;
+        } else {
+            let local_iov = iovec {
+                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+            let remote_iov = iovec {
+                iov_base: address as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+
+            let bytes_read =
+                unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
+            if bytes_read < 0 {
+                let os_error = Error::last_os_error().raw_os_error();
+                return Err(match os_error {
+                    Some(EFAULT) => MemoryError::OutOfRange,
+                    Some(ESRCH) => MemoryError::ProcessQuit,
+                    Some(EPERM) => MemoryError::PermissionDenied,
+                    _ => MemoryError::Unknown,
+                });
+            } else if (bytes_read as usize) < buffer.len() {
+                return Err(MemoryError::PartialTransfer(
+                    bytes_read as usize,
+                    buffer.len(),
+                ));
+            }
+        }
+
+        let slice: &[T] = match bytemuck::try_cast_slice(&buffer) {
+            Ok(value) => Ok(value),
+            Err(_) => Err(MemoryError::InvalidData(std::any::type_name::<T>())),
+        }?;
+        Ok(slice.to_vec())
+    }
+
     /// write a value T to the specified address.
     ///
     /// the type must implement [`bytemuck::NoUninit`].
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
     pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
         let mut buffer = bytemuck::bytes_of(value).to_vec();
+        if self.mode == MemoryMode::File {
+            self.memory
+                .write_at(&buffer, address as u64)
+                .map_err(Process::map_mem_error)?;
+        } else {
+            let local_iov = iovec {
+                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+            let remote_iov = iovec {
+                iov_base: address as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+
+            let bytes_written =
+                unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
+            if bytes_written < 0 {
+                let os_error = Error::last_os_error().raw_os_error();
+                return Err(match os_error {
+                    Some(EFAULT) => MemoryError::OutOfRange,
+                    Some(ESRCH) => MemoryError::ProcessQuit,
+                    Some(EPERM) => MemoryError::PermissionDenied,
+                    _ => MemoryError::Unknown,
+                });
+            } else if (bytes_written as usize) < buffer.len() {
+                return Err(MemoryError::PartialTransfer(
+                    bytes_written as usize,
+                    buffer.len(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// write a vec of T to the specified address.
+    ///
+    /// the type must implement [`bytemuck::NoUninit`].
+    /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
+    pub fn write_vec<T: NoUninit>(&self, address: usize, value: &[T]) -> Result<(), MemoryError> {
+        let mut buffer = bytemuck::cast_slice(value).to_vec();
         if self.mode == MemoryMode::File {
             self.memory
                 .write_at(&buffer, address as u64)
@@ -429,12 +519,33 @@ mod tests {
     }
 
     #[test]
+    fn read_vec() -> Result<(), MemoryError> {
+        let process = Process::open_pid(pid()).unwrap();
+        let buffer = [0x11u8, 0x22, 0x33, 0x44];
+        let addr = buffer.as_ptr() as usize;
+        let values: Vec<u8> = process.read_vec(addr, buffer.len())?;
+        assert_eq!(values, buffer.to_vec());
+        Ok(())
+    }
+
+    #[test]
     fn write() -> Result<(), MemoryError> {
         let process = Process::open_pid(pid()).unwrap();
         let buffer = [0x55u8];
         const VALUE: u8 = 0x66;
         process.write::<u8>(buffer.as_ptr() as usize, &VALUE)?;
         assert!(buffer[0] == VALUE);
+        Ok(())
+    }
+
+    #[test]
+    fn write_vec() -> Result<(), MemoryError> {
+        let process = Process::open_pid(pid()).unwrap();
+        let mut buffer = [0x11u8, 0x22, 0x33, 0x44];
+        let addr = buffer.as_mut_ptr() as usize;
+        let to_write = [0x44u8, 0x33, 0x22, 0x11];
+        process.write_vec(addr, &to_write)?;
+        assert_eq!(buffer, to_write);
         Ok(())
     }
 

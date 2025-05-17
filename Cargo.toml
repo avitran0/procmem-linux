@@ -1,6 +1,6 @@
 [package]
 name = "procmem-linux"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 authors = ["avitran0"]
 license = "GPL-3.0"
@@ -15,3 +15,10 @@ categories = ["os::linux-apis", "memory-management", "security"]
 bytemuck = "1"
 libc = "0.2"
 thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.6"
+
+[[bench]]
+name = "bench"
+harness = false

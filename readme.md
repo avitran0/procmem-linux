@@ -40,6 +40,10 @@ fn main() -> Result<(), MemoryError> {
     // write a string
     proc.write_string(0x7ffd_1234_5678, "Hello World")?;
 
+    // read a vector of type T of length 4 at a given address
+    let value_vec: Vec<u8> = proc.read(0x7ffd_1234_5678, 4)?;
+    println!("values at address: {:?}", value_vec);
+
     // scan an ida pattern ("Hello World", with two wildcards)
     let pattern = proc.scan_pattern("48 65 ? ? 6f 20 57 6f 72 6c 64", 0x7ffd_1234_5678)?;
     println!("pattern address: {}", pattern);
@@ -57,6 +61,8 @@ this requires `kernel >= 3.2` and `glibc >= 2.15`.
 
 in **File mode**, it opens `/proc/{pid}/mem` and uses normal read/write syscalls.
 this is slower, but might be necessary as a fallback, or when write permissions are restricted.
+
+File mode is about 12.5% slower than Syscall mode, based on rudimentary benchmarks.
 
 the default mode is to try and use syscall mode, but this can be overridden if wanted:
 
