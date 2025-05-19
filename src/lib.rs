@@ -2,19 +2,23 @@
 
 use std::{
     fs::{File, OpenOptions, read_dir, read_link},
-    io::{BufRead, BufReader, Error, ErrorKind},
+    io::{BufRead, BufReader, Error},
     os::unix::fs::FileExt,
     path::Path,
+    str::FromStr,
 };
 
 pub use bytemuck::{AnyBitPattern, NoUninit};
 use error::{MemoryError, ProcessError};
 #[cfg(feature = "syscall")]
-use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv, process_vm_writev};
+use libc::{iovec, process_vm_readv, process_vm_writev};
+use library::LibraryInfo;
 
 mod elf;
 /// errors for process handling and memory operations
 pub mod error;
+/// loaded library info
+pub mod library;
 
 /// mode used to read and write memory.
 #[derive(PartialEq)]
@@ -34,7 +38,7 @@ pub struct Process {
 
 impl Process {
     fn find_pid<S: AsRef<str>>(name: S) -> Result<i32, ProcessError> {
-        let dir = read_dir("/proc").map_err(Self::map_proc_error)?;
+        let dir = read_dir("/proc").map_err(ProcessError::Io)?;
         for dir_entry in dir {
             let entry = match dir_entry {
                 Ok(entry) => entry,
@@ -70,29 +74,11 @@ impl Process {
             };
 
             if exe_name == name.as_ref() {
-                let pid = pid
-                    .parse::<i32>()
-                    .map_err(|error| ProcessError::InvalidPid(error.kind().clone()))?;
+                let pid = pid.parse::<i32>()?;
                 return Ok(pid);
             }
         }
         Err(ProcessError::NotFound)
-    }
-
-    fn map_proc_error(error: Error) -> ProcessError {
-        if error.kind() == ErrorKind::PermissionDenied {
-            ProcessError::PermissionDenied
-        } else {
-            ProcessError::FileOpenError
-        }
-    }
-
-    fn map_mem_error(error: Error) -> MemoryError {
-        if error.kind() == ErrorKind::PermissionDenied {
-            MemoryError::PermissionDenied
-        } else {
-            MemoryError::Unknown
-        }
     }
 
     /// open a process given its executable name.
@@ -131,7 +117,7 @@ impl Process {
             .read(true)
             .write(true)
             .open(format!("/proc/{pid}/mem"))
-            .map_err(Self::map_proc_error)?;
+            .map_err(ProcessError::Io)?;
 
         Ok(Process {
             pid,
@@ -172,13 +158,7 @@ impl Process {
         let bytes_read = unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
 
         if bytes_read < 0 {
-            let os_error = Error::last_os_error().raw_os_error();
-            Err(match os_error {
-                Some(EFAULT) => MemoryError::OutOfRange,
-                Some(ESRCH) => MemoryError::ProcessQuit,
-                Some(EPERM) => MemoryError::PermissionDenied,
-                _ => MemoryError::Unknown,
-            })
+            Err(MemoryError::Io(Error::last_os_error()))
         } else if (bytes_read as usize) < buffer.len() {
             Err(MemoryError::PartialTransfer(
                 bytes_read as usize,
@@ -204,7 +184,7 @@ impl Process {
         if self.mode == MemoryMode::File {
             self.memory
                 .read_at(buffer, address as u64)
-                .map_err(Process::map_mem_error)
+                .map_err(MemoryError::Io)
         } else {
             self.syscall_read(buffer, address)
         }
@@ -258,13 +238,7 @@ impl Process {
         let bytes_written =
             unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
         if bytes_written < 0 {
-            let os_error = Error::last_os_error().raw_os_error();
-            Err(match os_error {
-                Some(EFAULT) => MemoryError::OutOfRange,
-                Some(ESRCH) => MemoryError::ProcessQuit,
-                Some(EPERM) => MemoryError::PermissionDenied,
-                _ => MemoryError::Unknown,
-            })
+            Err(MemoryError::Io(Error::last_os_error()))
         } else if (bytes_written as usize) < buffer.len() {
             Err(MemoryError::PartialTransfer(
                 bytes_written as usize,
@@ -290,7 +264,7 @@ impl Process {
         if self.mode == MemoryMode::File {
             self.memory
                 .write_at(buffer, address as u64)
-                .map_err(Process::map_mem_error)
+                .map_err(MemoryError::Io)
         } else {
             self.syscall_write(buffer, address)
         }
@@ -331,7 +305,7 @@ impl Process {
         let mut buffer = vec![0u8; count];
         self.memory
             .read_at(&mut buffer, address as u64)
-            .map_err(Process::map_mem_error)?;
+            .map_err(MemoryError::Io)?;
         Ok(buffer)
     }
 
@@ -343,7 +317,7 @@ impl Process {
     pub fn write_bytes(&self, address: usize, value: &[u8]) -> Result<(), MemoryError> {
         self.memory
             .write_at(value, address as u64)
-            .map_err(Process::map_mem_error)?;
+            .map_err(MemoryError::Io)?;
         Ok(())
     }
 
@@ -384,57 +358,81 @@ impl Process {
         self.write_bytes(address, value.as_ref().as_bytes())
     }
 
+    fn maps(&self) -> String {
+        format!("/proc/{}/maps", self.pid)
+    }
+
     /// parses `/proc/{pid}/maps` to locate the base address of a loaded
     /// library with name matching `library`.
-    pub fn find_library<S: AsRef<str>>(&self, library: S) -> Result<usize, MemoryError> {
-        let maps =
-            File::open(format!("/proc/{}/maps", self.pid)).map_err(Process::map_mem_error)?;
+    pub fn find_library<S: AsRef<str>>(&self, lib_name: S) -> Result<LibraryInfo, ProcessError> {
+        let libraries = self.all_libraries()?;
+        for lib in libraries {
+            if let Some(path) = lib.path() {
+                if !path.starts_with('/') {
+                    continue;
+                }
+                let Some((_, file_name)) = path.rsplit_once('/') else {
+                    continue;
+                };
+                if file_name.starts_with(lib_name.as_ref()) {
+                    return Ok(lib);
+                }
+            }
+        }
+        Err(ProcessError::NotFound)
+    }
+
+    pub fn all_libraries(&self) -> Result<Vec<LibraryInfo>, ProcessError> {
+        let mut libraries = Vec::with_capacity(8);
+
+        let maps = File::open(self.maps()).map_err(ProcessError::Io)?;
         for line in BufReader::new(maps).lines() {
             let Ok(line) = line else {
                 continue;
             };
-            let Some((line, file_name)) = line.rsplit_once('/') else {
-                continue;
-            };
-            if !file_name.contains(library.as_ref()) {
-                continue;
-            }
-            let Some((address, _)) = line.split_once('-') else {
-                return Err(MemoryError::Unknown);
-            };
-            let address = usize::from_str_radix(address, 16)
-                .map_err(|_| MemoryError::InvalidData(std::any::type_name::<usize>()))?;
-            return Ok(address);
+            let lib = LibraryInfo::from_str(&line)?;
+            libraries.push(lib);
         }
-        Err(MemoryError::NotFound)
+
+        Ok(libraries)
     }
 
-    /// returns the size of a library at `address`, in bytes.
-    pub fn library_size(&self, address: usize) -> Result<usize, MemoryError> {
+    /// returns the size of an elf library
+    pub fn elf_size(&self, library: &LibraryInfo) -> Result<usize, MemoryError> {
+        if library.offset() != 0 {
+            return Err(MemoryError::OutOfRange);
+        }
         // check if elf header is present
-        let header = self.read::<u32>(address)?;
+        let header = self.read::<u32>(library.start())?;
         if header != 0x464C457F && header != 0x7F454C46 {
             return Err(MemoryError::OutOfRange);
         }
-        let section_header_offset = self.read::<usize>(address + elf::SECTION_HEADER_OFFSET)?;
+        let section_header_offset =
+            self.read::<usize>(library.start() + elf::SECTION_HEADER_OFFSET)?;
         let section_header_entry_size =
-            self.read::<u16>(address + elf::SECTION_HEADER_ENTRY_SIZE)? as usize;
+            self.read::<u16>(library.start() + elf::SECTION_HEADER_ENTRY_SIZE)? as usize;
         let section_header_num_entries =
-            self.read::<u16>(address + elf::SECTION_HEADER_NUM_ENTRIES)? as usize;
+            self.read::<u16>(library.start() + elf::SECTION_HEADER_NUM_ENTRIES)? as usize;
 
         Ok(section_header_offset + section_header_entry_size * section_header_num_entries)
     }
 
-    /// dump a library at base address `address`.
+    /// dump a complete elf library.
+    ///
     /// this will return a complete copy of the library, as it is loaded into memory.
-    pub fn dump_library(&self, address: usize) -> Result<Vec<u8>, MemoryError> {
+    ///
+    /// it will fail if the library is not a valid elf, or the library offset is not 0.
+    pub fn dump_library(&self, library: &LibraryInfo) -> Result<Vec<u8>, MemoryError> {
+        if library.offset() != 0 {
+            return Err(MemoryError::InvalidLibrary);
+        }
         // check if elf header is present
-        let header = self.read::<u32>(address)?;
+        let header = self.read::<u32>(library.start())?;
         if header != 0x464C457F && header != 0x7F454C46 {
             return Err(MemoryError::OutOfRange);
         }
-        let lib_size = self.library_size(address)?;
-        self.read_bytes(address, lib_size)
+        let lib_size = self.elf_size(library)?;
+        self.read_bytes(library.start(), lib_size)
     }
 
     /// scan a pattern in library at `address`, using `pattern`.
@@ -452,7 +450,7 @@ impl Process {
     pub fn scan_pattern<S: AsRef<str>>(
         &self,
         pattern: S,
-        address: usize,
+        library: &LibraryInfo,
     ) -> Result<usize, MemoryError> {
         let pattern_string = pattern.as_ref();
         let mut pattern = Vec::with_capacity(pattern_string.len());
@@ -471,7 +469,7 @@ impl Process {
             }
         }
 
-        let module = self.dump_library(address)?;
+        let module = self.dump_library(library)?;
         if module.len() < 500 {
             return Err(MemoryError::InvalidLibrary);
         }
@@ -484,7 +482,7 @@ impl Process {
                     continue 'outer;
                 }
             }
-            return Ok(address + i);
+            return Ok(library.start() + i);
         }
         Err(MemoryError::NotFound)
     }
@@ -492,7 +490,7 @@ impl Process {
 
 #[cfg(test)]
 mod tests {
-    use crate::error::MemoryError;
+    use crate::error::{MemoryError, ProcessError};
 
     use super::Process;
 
@@ -592,7 +590,7 @@ mod tests {
         // find loaded process elf
         let exe_path = std::env::current_exe().unwrap();
         let exe_name = exe_path.file_name().unwrap().to_str().unwrap();
-        let lib = process.find_library(exe_name)?;
+        let lib = process.find_library(exe_name).unwrap();
 
         // convert hello world string to ida pattern
         let pattern = STRING
@@ -602,8 +600,16 @@ mod tests {
             .collect::<Vec<String>>()
             .join(" ");
 
-        let value = process.scan_pattern(pattern, lib)?;
+        let value = process.scan_pattern(pattern, &lib)?;
         assert_eq!(value, STRING.as_ptr() as usize);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_library() -> Result<(), ProcessError> {
+        let process = Process::open_pid(pid())?;
+        let libraries = process.all_libraries()?;
+        assert!(libraries.iter().any(|lib| lib.path() == Some("[heap]")));
         Ok(())
     }
 }

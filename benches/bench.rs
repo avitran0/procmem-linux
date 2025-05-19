@@ -169,7 +169,7 @@ pub fn bench_scan_pattern(c: &mut Criterion) {
     c.bench_function("scan_pattern", |b| {
         b.iter(|| {
             let _ = process
-                .scan_pattern(black_box(pattern.clone()), black_box(lib))
+                .scan_pattern(black_box(pattern.clone()), black_box(&lib))
                 .unwrap();
         });
     });

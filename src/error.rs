@@ -1,6 +1,8 @@
-use std::num::IntErrorKind;
+use std::{io::Error, num::ParseIntError};
 
 use thiserror::Error;
+
+use crate::library::ParseLibraryError;
 
 /// errors relating to the process struct.
 #[derive(Error, Debug)]
@@ -8,11 +10,11 @@ pub enum ProcessError {
     #[error("the requested process could not be found")]
     NotFound,
     #[error("the pid of the requested process is not valid")]
-    InvalidPid(IntErrorKind),
-    #[error("permission to open file was denied")]
-    PermissionDenied,
-    #[error("failed to open file")]
-    FileOpenError,
+    InvalidPid(#[from] ParseIntError),
+    #[error("unable to parse library")]
+    InvalidLibrary(#[from] ParseLibraryError),
+    #[error("misc io error")]
+    Io(Error),
 }
 
 /// errors relating to memory reads/writes.
@@ -22,8 +24,6 @@ pub enum MemoryError {
     OutOfRange,
     #[error("the process has quit")]
     ProcessQuit,
-    #[error("permission to memory was denied")]
-    PermissionDenied,
     #[error("data could not be parsed to type {0}")]
     InvalidData(&'static str),
     #[error("only {0} out of {1} bytes could be transferred")]
@@ -36,6 +36,8 @@ pub enum MemoryError {
     InvalidString,
     #[error("pattern was not found")]
     NotFound,
-    #[error("unknown read error")]
+    #[error("misc io error")]
+    Io(#[from] Error),
+    #[error("unknown memory error")]
     Unknown,
 }
