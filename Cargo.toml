@@ -11,9 +11,13 @@ readme = "readme.md"
 keywords = ["memory", "debugging", "linux"]
 categories = ["os::linux-apis", "memory-management", "security"]
 
+[features]
+default = ["syscall"]
+syscall = ["dep:libc"]
+
 [dependencies]
 bytemuck = "1"
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 thiserror = "2"
 
 [dev-dependencies]

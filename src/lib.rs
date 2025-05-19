@@ -7,8 +7,9 @@ use std::{
     path::Path,
 };
 
-use bytemuck::{AnyBitPattern, NoUninit};
+pub use bytemuck::{AnyBitPattern, NoUninit};
 use error::{MemoryError, ProcessError};
+#[cfg(feature = "syscall")]
 use libc::{EFAULT, EPERM, ESRCH, iovec, process_vm_readv, process_vm_writev};
 
 mod elf;
@@ -33,8 +34,11 @@ pub struct Process {
 
 impl Process {
     fn find_pid<S: AsRef<str>>(name: S) -> Result<i32, ProcessError> {
-        for dir in read_dir("/proc").unwrap() {
-            let entry = match dir {
+        let Ok(dir) = read_dir("/proc") else {
+            return Err(ProcessError::NotFound);
+        };
+        for dir_entry in dir {
+            let entry = match dir_entry {
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
@@ -104,13 +108,18 @@ impl Process {
     pub fn open_pid(pid: i32) -> Result<Process, ProcessError> {
         // test whether process_vm_readv is a valid syscall
         // call it with dummy data and see what happens
-        let mut dummy_data = [0u8; 1];
-        let iov = iovec {
-            iov_base: dummy_data.as_mut_ptr() as *mut libc::c_void,
-            iov_len: 1,
-        };
+        #[cfg(feature = "syscall")]
+        let has_proc_read = {
+            let mut dummy_data = [0u8; 1];
+            let iov = iovec {
+                iov_base: dummy_data.as_mut_ptr() as *mut libc::c_void,
+                iov_len: 1,
+            };
 
-        let has_proc_read = unsafe { process_vm_readv(pid, &iov, 1, &iov, 1, 0) } > 0;
+            unsafe { process_vm_readv(pid, &iov, 1, &iov, 1, 0) > 0 }
+        };
+        #[cfg(not(feature = "syscall"))]
+        let has_proc_read = false;
 
         let memory = OpenOptions::new()
             .read(true)
@@ -150,40 +159,55 @@ impl Process {
         self.pid
     }
 
+    fn syscall_read(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
+        let local_iov = iovec {
+            iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buffer.len(),
+        };
+        let remote_iov = iovec {
+            iov_base: address as *mut libc::c_void,
+            iov_len: buffer.len(),
+        };
+
+        let bytes_read = unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
+
+        if bytes_read < 0 {
+            let os_error = Error::last_os_error().raw_os_error();
+            Err(match os_error {
+                Some(EFAULT) => MemoryError::OutOfRange,
+                Some(ESRCH) => MemoryError::ProcessQuit,
+                Some(EPERM) => MemoryError::PermissionDenied,
+                _ => MemoryError::Unknown,
+            })
+        } else if (bytes_read as usize) < buffer.len() {
+            Err(MemoryError::PartialTransfer(
+                bytes_read as usize,
+                buffer.len(),
+            ))
+        } else {
+            Ok(bytes_read as usize)
+        }
+    }
+
+    #[cfg(not(feature = "syscall"))]
     #[inline]
     fn read_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
+        self.memory
+            .read_at(buffer, address as u64)
+            .map_err(Process::map_mem_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "syscall")]
+    #[inline]
+    fn read_impl(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
         if self.mode == MemoryMode::File {
             self.memory
                 .read_at(buffer, address as u64)
-                .map_err(Process::map_mem_error)?;
+                .map_err(Process::map_mem_error)
         } else {
-            let local_iov = iovec {
-                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-            let remote_iov = iovec {
-                iov_base: address as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-
-            let bytes_read =
-                unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
-            if bytes_read < 0 {
-                let os_error = Error::last_os_error().raw_os_error();
-                return Err(match os_error {
-                    Some(EFAULT) => MemoryError::OutOfRange,
-                    Some(ESRCH) => MemoryError::ProcessQuit,
-                    Some(EPERM) => MemoryError::PermissionDenied,
-                    _ => MemoryError::Unknown,
-                });
-            } else if (bytes_read as usize) < buffer.len() {
-                return Err(MemoryError::PartialTransfer(
-                    bytes_read as usize,
-                    buffer.len(),
-                ));
-            }
+            self.syscall_read(buffer, address)
         }
-        Ok(())
     }
 
     /// read a value T from the specified address.
@@ -221,60 +245,81 @@ impl Process {
         Ok(slice.to_vec())
     }
 
+    fn syscall_write(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
+        let local_iov = iovec {
+            iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buffer.len(),
+        };
+        let remote_iov = iovec {
+            iov_base: address as *mut libc::c_void,
+            iov_len: buffer.len(),
+        };
+
+        let bytes_written =
+            unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
+        if bytes_written < 0 {
+            let os_error = Error::last_os_error().raw_os_error();
+            Err(match os_error {
+                Some(EFAULT) => MemoryError::OutOfRange,
+                Some(ESRCH) => MemoryError::ProcessQuit,
+                Some(EPERM) => MemoryError::PermissionDenied,
+                _ => MemoryError::Unknown,
+            })
+        } else if (bytes_written as usize) < buffer.len() {
+            Err(MemoryError::PartialTransfer(
+                bytes_written as usize,
+                buffer.len(),
+            ))
+        } else {
+            Ok(bytes_written as usize)
+        }
+    }
+
+    #[cfg(not(feature = "syscall"))]
     #[inline]
     fn write_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
+        self.memory
+            .write_at(buffer, address as u64)
+            .map_err(Process::map_mem_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "syscall")]
+    #[inline]
+    fn write_impl(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
         if self.mode == MemoryMode::File {
             self.memory
                 .write_at(buffer, address as u64)
-                .map_err(Process::map_mem_error)?;
+                .map_err(Process::map_mem_error)
         } else {
-            let local_iov = iovec {
-                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-            let remote_iov = iovec {
-                iov_base: address as *mut libc::c_void,
-                iov_len: buffer.len(),
-            };
-
-            let bytes_written =
-                unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
-            if bytes_written < 0 {
-                let os_error = Error::last_os_error().raw_os_error();
-                return Err(match os_error {
-                    Some(EFAULT) => MemoryError::OutOfRange,
-                    Some(ESRCH) => MemoryError::ProcessQuit,
-                    Some(EPERM) => MemoryError::PermissionDenied,
-                    _ => MemoryError::Unknown,
-                });
-            } else if (bytes_written as usize) < buffer.len() {
-                return Err(MemoryError::PartialTransfer(
-                    bytes_written as usize,
-                    buffer.len(),
-                ));
-            }
+            self.syscall_write(buffer, address)
         }
-        Ok(())
     }
 
     /// write a value T to the specified address.
     ///
+    /// returns number of bytes written.
+    ///
     /// the type must implement [`bytemuck::NoUninit`].
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
-    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
+    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<usize, MemoryError> {
         let mut buffer = bytemuck::bytes_of(value).to_vec();
-        self.write_impl(&mut buffer, address)?;
-        Ok(())
+        self.write_impl(&mut buffer, address)
     }
 
     /// write a vec of T to the specified address.
     ///
+    /// returns number of bytes written.
+    ///
     /// the type must implement [`bytemuck::NoUninit`].
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
-    pub fn write_vec<T: NoUninit>(&self, address: usize, value: &[T]) -> Result<(), MemoryError> {
+    pub fn write_vec<T: NoUninit>(
+        &self,
+        address: usize,
+        value: &[T],
+    ) -> Result<usize, MemoryError> {
         let mut buffer = bytemuck::cast_slice(value).to_vec();
-        self.write_impl(&mut buffer, address)?;
-        Ok(())
+        self.write_impl(&mut buffer, address)
     }
 
     /// reads `count` bytes starting at `address`, using File mode.

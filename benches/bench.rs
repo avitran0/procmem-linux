@@ -17,14 +17,6 @@ const fn u64_inv() -> [u8; 8] {
     0xfedcba0987654321u64.to_ne_bytes()
 }
 
-pub fn bench_open_pid(c: &mut Criterion) {
-    c.bench_function("open_pid", |b| {
-        b.iter(|| {
-            let _ = Process::open_pid(black_box(pid())).unwrap();
-        });
-    });
-}
-
 pub fn bench_read_u64(c: &mut Criterion) {
     let process = Process::open_pid(pid()).unwrap();
     let buffer = u64();
@@ -185,7 +177,6 @@ pub fn bench_scan_pattern(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_open_pid,
     bench_read_u64,
     bench_read_vec,
     bench_write_u64,
