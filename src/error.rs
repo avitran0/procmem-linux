@@ -9,10 +9,10 @@ pub enum ProcessError {
     NotFound,
     #[error("the pid of the requested process is not valid")]
     InvalidPid(IntErrorKind),
-    #[error("permission to open /proc/{0}/mem was denied")]
-    PermissionDenied(i32),
-    #[error("failed to open /proc/{0}/mem")]
-    FileOpenError(i32),
+    #[error("permission to open file was denied")]
+    PermissionDenied,
+    #[error("failed to open file")]
+    FileOpenError,
 }
 
 /// errors relating to memory reads/writes.

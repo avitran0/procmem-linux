@@ -34,9 +34,7 @@ pub struct Process {
 
 impl Process {
     fn find_pid<S: AsRef<str>>(name: S) -> Result<i32, ProcessError> {
-        let Ok(dir) = read_dir("/proc") else {
-            return Err(ProcessError::NotFound);
-        };
+        let dir = read_dir("/proc").map_err(Self::map_proc_error)?;
         for dir_entry in dir {
             let entry = match dir_entry {
                 Ok(entry) => entry,
@@ -79,6 +77,14 @@ impl Process {
             }
         }
         Err(ProcessError::NotFound)
+    }
+
+    fn map_proc_error(error: Error) -> ProcessError {
+        if error.kind() == ErrorKind::PermissionDenied {
+            ProcessError::PermissionDenied
+        } else {
+            ProcessError::FileOpenError
+        }
     }
 
     fn map_mem_error(error: Error) -> MemoryError {
@@ -125,13 +131,7 @@ impl Process {
             .read(true)
             .write(true)
             .open(format!("/proc/{pid}/mem"))
-            .map_err(|error| {
-                if error.kind() == ErrorKind::PermissionDenied {
-                    ProcessError::PermissionDenied(pid)
-                } else {
-                    ProcessError::FileOpenError(pid)
-                }
-            })?;
+            .map_err(Self::map_proc_error)?;
 
         Ok(Process {
             pid,
