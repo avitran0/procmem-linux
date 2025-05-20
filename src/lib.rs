@@ -2,7 +2,7 @@
 
 use std::{
     fs::{File, OpenOptions, read_dir, read_link},
-    io::{BufRead, BufReader, Error},
+    io::{BufRead, BufReader},
     os::unix::fs::FileExt,
     path::Path,
     str::FromStr,
@@ -26,6 +26,7 @@ pub enum MemoryMode {
     /// use file i/o on `/proc/{pid}/mem`.
     File,
     /// use `process_vm_readv` and `process_vm_writev` syscalls.
+    #[cfg(feature = "syscall")]
     Syscall,
 }
 
@@ -110,8 +111,6 @@ impl Process {
 
             unsafe { process_vm_readv(pid, &iov, 1, &iov, 1, 0) > 0 }
         };
-        #[cfg(not(feature = "syscall"))]
-        let has_proc_read = false;
 
         let memory = OpenOptions::new()
             .read(true)
@@ -122,15 +121,19 @@ impl Process {
         Ok(Process {
             pid,
             memory,
+            #[cfg(feature = "syscall")]
             mode: if has_proc_read {
                 MemoryMode::Syscall
             } else {
                 MemoryMode::File
             },
+            #[cfg(not(feature = "syscall"))]
+            mode: MemoryMode::File,
         })
     }
 
     /// switch between `Syscall` and `File` mode at runtime.
+    #[cfg(feature = "syscall")]
     pub fn set_mode(&mut self, mode: MemoryMode) {
         self.mode = mode;
     }
@@ -145,7 +148,8 @@ impl Process {
         self.pid
     }
 
-    fn syscall_read(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
+    #[cfg(feature = "syscall")]
+    fn syscall_read(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         let local_iov = iovec {
             iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
             iov_len: buffer.len(),
@@ -158,14 +162,14 @@ impl Process {
         let bytes_read = unsafe { process_vm_readv(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
 
         if bytes_read < 0 {
-            Err(MemoryError::Io(Error::last_os_error()))
+            Err(MemoryError::Io(std::io::Error::last_os_error()))
         } else if (bytes_read as usize) < buffer.len() {
             Err(MemoryError::PartialTransfer(
                 bytes_read as usize,
                 buffer.len(),
             ))
         } else {
-            Ok(bytes_read as usize)
+            Ok(())
         }
     }
 
@@ -174,17 +178,18 @@ impl Process {
     fn read_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         self.memory
             .read_at(buffer, address as u64)
-            .map_err(Process::map_mem_error)?;
+            .map_err(MemoryError::Io)?;
         Ok(())
     }
 
     #[cfg(feature = "syscall")]
     #[inline]
-    fn read_impl(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
+    fn read_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         if self.mode == MemoryMode::File {
             self.memory
                 .read_at(buffer, address as u64)
-                .map_err(MemoryError::Io)
+                .map_err(MemoryError::Io)?;
+            Ok(())
         } else {
             self.syscall_read(buffer, address)
         }
@@ -225,7 +230,8 @@ impl Process {
         Ok(slice.to_vec())
     }
 
-    fn syscall_write(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
+    #[cfg(feature = "syscall")]
+    fn syscall_write(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         let local_iov = iovec {
             iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
             iov_len: buffer.len(),
@@ -238,14 +244,14 @@ impl Process {
         let bytes_written =
             unsafe { process_vm_writev(self.pid, &local_iov, 1, &remote_iov, 1, 0) };
         if bytes_written < 0 {
-            Err(MemoryError::Io(Error::last_os_error()))
+            Err(MemoryError::Io(std::io::Error::last_os_error()))
         } else if (bytes_written as usize) < buffer.len() {
             Err(MemoryError::PartialTransfer(
                 bytes_written as usize,
                 buffer.len(),
             ))
         } else {
-            Ok(bytes_written as usize)
+            Ok(())
         }
     }
 
@@ -254,17 +260,18 @@ impl Process {
     fn write_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         self.memory
             .write_at(buffer, address as u64)
-            .map_err(Process::map_mem_error)?;
+            .map_err(MemoryError::Io)?;
         Ok(())
     }
 
     #[cfg(feature = "syscall")]
     #[inline]
-    fn write_impl(&self, buffer: &mut [u8], address: usize) -> Result<usize, MemoryError> {
+    fn write_impl(&self, buffer: &mut [u8], address: usize) -> Result<(), MemoryError> {
         if self.mode == MemoryMode::File {
             self.memory
                 .write_at(buffer, address as u64)
-                .map_err(MemoryError::Io)
+                .map_err(MemoryError::Io)?;
+            Ok(())
         } else {
             self.syscall_write(buffer, address)
         }
@@ -276,7 +283,7 @@ impl Process {
     ///
     /// the type must implement [`bytemuck::NoUninit`].
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
-    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<usize, MemoryError> {
+    pub fn write<T: NoUninit>(&self, address: usize, value: &T) -> Result<(), MemoryError> {
         let mut buffer = bytemuck::bytes_of(value).to_vec();
         self.write_impl(&mut buffer, address)
     }
@@ -287,11 +294,7 @@ impl Process {
     ///
     /// the type must implement [`bytemuck::NoUninit`].
     /// in Syscall mode uses `process_vm_writev`, in File mode uses FileExt::write_at.
-    pub fn write_vec<T: NoUninit>(
-        &self,
-        address: usize,
-        value: &[T],
-    ) -> Result<usize, MemoryError> {
+    pub fn write_vec<T: NoUninit>(&self, address: usize, value: &[T]) -> Result<(), MemoryError> {
         let mut buffer = bytemuck::cast_slice(value).to_vec();
         self.write_impl(&mut buffer, address)
     }
@@ -367,6 +370,9 @@ impl Process {
     pub fn find_library<S: AsRef<str>>(&self, lib_name: S) -> Result<LibraryInfo, ProcessError> {
         let libraries = self.all_libraries()?;
         for lib in libraries {
+            if lib.offset() != 0 {
+                continue;
+            }
             if let Some(path) = lib.path() {
                 if !path.starts_with('/') {
                     continue;

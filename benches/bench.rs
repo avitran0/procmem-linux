@@ -68,6 +68,7 @@ pub fn bench_write_vec(c: &mut Criterion) {
     });
 }
 
+#[cfg(feature = "syscall")]
 pub fn bench_read_u64_syscall(c: &mut Criterion) {
     let mut process = Process::open_pid(pid()).unwrap();
     process.set_mode(MemoryMode::Syscall);
@@ -80,6 +81,9 @@ pub fn bench_read_u64_syscall(c: &mut Criterion) {
         });
     });
 }
+
+#[cfg(not(feature = "syscall"))]
+pub fn bench_read_u64_syscall(_c: &mut Criterion) {}
 
 pub fn bench_read_u64_file(c: &mut Criterion) {
     let mut process = Process::open_pid(pid()).unwrap();
